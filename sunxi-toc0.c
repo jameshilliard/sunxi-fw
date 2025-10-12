@@ -1052,6 +1052,59 @@ void output_toc0_info(void *sector, FILE *inf, FILE *stream, bool verbose)
 		return;
 	}
 
+	/* CRITICAL: Check NAND config at offset 0x80 BEFORE any other validation
+	 * The SBROM NAND boot code reads this FIRST to configure the NAND controller
+	 * before it can properly read the rest of the TOC0 from NAND flash.
+	 * If this is missing or corrupt, NAND boot will FAIL immediately.
+	 */
+	#define TOC0_HEADER_NAND_CONFIG_OFFSET 0x80
+	if (bytes_in_sector >= TOC0_HEADER_NAND_CONFIG_OFFSET + 64) {
+		const uint8_t *header_nand_area = (const uint8_t *)sector + TOC0_HEADER_NAND_CONFIG_OFFSET;
+
+		/* Check if this area contains "IIE;" or "MIE;" (item marker) - WRONG! */
+		if (memcmp(header_nand_area + 12, "IIE;", 4) == 0 || memcmp(header_nand_area + 12, "MIE;", 4) == 0) {
+			fprintf(stream, "\n");
+			fprintf(stream, "╔═══════════════════════════════════════════════════════════╗\n");
+			fprintf(stream, "║  ✗ CRITICAL ERROR: NAND Boot Configuration Missing!      ║\n");
+			fprintf(stream, "╚═══════════════════════════════════════════════════════════╝\n");
+			fprintf(stream, "\nTOC0 Header Extension Area (offset 0x80):\n");
+			fprintf(stream, "  Found: TOC0 item marker at offset 0x8C\n");
+			fprintf(stream, "  Expected: Raw NAND parameters or TLV NAND config\n");
+			fprintf(stream, "\nWhy this fails:\n");
+			fprintf(stream, "  1. SBROM NAND boot reads offset 0x80 FIRST\n");
+			fprintf(stream, "  2. Uses these parameters to configure NAND controller\n");
+			fprintf(stream, "  3. Then reads the rest of TOC0 using proper NAND timing\n");
+			fprintf(stream, "  4. Without valid NAND config at 0x80, it cannot read TOC0!\n");
+			fprintf(stream, "\nCurrent (BROKEN) structure:\n");
+			fprintf(stream, "  0x00: TOC0 header\n");
+			fprintf(stream, "  0x80: ❌ Item marker (WRONG - should be NAND config)\n");
+			fprintf(stream, "  0x%zX: NAND config (TOO LATE - SBROM needs it at 0x80)\n", TOC0_STORAGE_DATA_OFFSET);
+			fprintf(stream, "\nCorrect structure:\n");
+			fprintf(stream, "  0x00: TOC0 header\n");
+			fprintf(stream, "  0x80: ✓ NAND configuration (embedded in header extension)\n");
+			fprintf(stream, "  Items start after header extension\n");
+			fprintf(stream, "\nResult: SBROM will REJECT this image and enter FEL mode!\n");
+			fprintf(stream, "\n");
+		} else {
+			/* Check if it looks like valid NAND config */
+			boot_nand_para_t *header_nand = (boot_nand_para_t *)header_nand_area;
+			bool has_valid_nand_at_0x80 = false;
+
+			if (header_nand->ChannelCnt >= 1 && header_nand->ChannelCnt <= 4 &&
+			    header_nand->ChipCnt >= 1 && header_nand->ChipCnt <= 8 &&
+			    header_nand->SectorCntPerPage > 0 && header_nand->SectorCntPerPage <= 64) {
+				has_valid_nand_at_0x80 = true;
+			} else if ((signed char)header_nand_area[0] == -0x5d) { /* 0xA3 TLV format */
+				has_valid_nand_at_0x80 = true;
+			}
+
+			if (has_valid_nand_at_0x80) {
+				fprintf(stream, "\n✓ TOC0 Header Extension Area (offset 0x80): Valid NAND configuration found\n");
+				fprintf(stream, "  This image should boot correctly from RAW NAND\n");
+			}
+		}
+	}
+
 	data_size = main_header.length;
 
 	if (data_size < sizeof(toc0_main_info)) {
