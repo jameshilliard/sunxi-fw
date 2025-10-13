@@ -1017,6 +1017,94 @@ static void print_toc0_item(const toc0_item_info *item,
 	}
 }
 
+/* Validate TOC0 structure padding per BSP requirements
+ * BSP createtoc0.c line 58 adds 3KB padding before first item:
+ * offset = ((sizeof(sbrom_toc0_head_info_t) + 2 * sizeof(sbrom_toc0_item_info_t) + 31) & (~31)) + 3*1024;
+ *
+ * Returns: 0 if padding looks correct, flags indicating issues otherwise
+ */
+#define PADDING_OK              0x0000
+#define PADDING_MISSING_3KB     0x0001  /* Missing 3KB padding */
+#define PADDING_TOO_SMALL       0x0002  /* Padding smaller than expected */
+#define PADDING_NO_ITEMS        0x0004  /* No items found */
+
+static int validate_toc0_padding(const toc0_main_info *main_info,
+                                  const toc0_item_info *items,
+                                  FILE *stream)
+{
+	uint32_t expected_base;
+	uint32_t expected_first_item_offset;
+	uint32_t actual_first_item_offset = UINT32_MAX;
+	const char *first_item_name = "UNKNOWN";
+	int flags = PADDING_OK;
+
+	if (main_info->num_items == 0) {
+		fprintf(stream, "\nTOC0 Padding Validation:\n");
+		fprintf(stream, "  No items found, cannot validate padding\n");
+		return PADDING_NO_ITEMS;
+	}
+
+	/* Find the first item (lowest offset) */
+	for (uint32_t i = 0; i < main_info->num_items; i++) {
+		if (items[i].offset < actual_first_item_offset) {
+			actual_first_item_offset = items[i].offset;
+			first_item_name = item_name(items[i].name);
+		}
+	}
+
+	/* Calculate expected first item offset with 3KB padding
+	 * BSP formula: ((header + N*item + 31) & ~31) + 3072
+	 */
+	expected_base = (sizeof(toc0_main_info) + main_info->num_items * sizeof(toc0_item_info) + 31) & ~31;
+	expected_first_item_offset = expected_base + 3072;  /* 3KB = 3072 bytes */
+
+	fprintf(stream, "\nTOC0 Padding Validation:\n");
+	fprintf(stream, "  Header + %u items base:      0x%03x (%u bytes)\n",
+	        main_info->num_items, expected_base, expected_base);
+	fprintf(stream, "  Expected first item offset:  0x%04x (%u bytes) [with 3KB padding]\n",
+	        expected_first_item_offset, expected_first_item_offset);
+	fprintf(stream, "  Actual first item offset:    0x%04x (%u bytes) [%s]\n",
+	        actual_first_item_offset, actual_first_item_offset, first_item_name);
+
+	/* Calculate actual padding */
+	if (actual_first_item_offset > expected_base) {
+		uint32_t actual_padding = actual_first_item_offset - expected_base;
+		fprintf(stream, "  Actual padding:              0x%03x (%u bytes)\n",
+		        actual_padding, actual_padding);
+
+		if (actual_padding == 3072) {
+			fprintf(stream, "  Status:                      ✓ CORRECT (3KB padding present)\n");
+			fprintf(stream, "  Compliance:                  BSP-compatible structure\n");
+		} else if (actual_padding < 3072) {
+			flags |= PADDING_TOO_SMALL;
+			fprintf(stream, "  Status:                      ✗ INCORRECT (padding too small by %u bytes)\n",
+			        3072 - actual_padding);
+			fprintf(stream, "  Compliance:                  NON-COMPLIANT with BSP requirements\n");
+			fprintf(stream, "\n  ⚠ WARNING: Missing 3KB padding may cause NAND boot failure!\n");
+			fprintf(stream, "    BSP TOC0 generation adds 3072 bytes before first item\n");
+			fprintf(stream, "    This padding may be required for proper SBROM operation\n");
+		} else {
+			fprintf(stream, "  Status:                      ⚠ UNUSUAL (padding larger than expected by %u bytes)\n",
+			        actual_padding - 3072);
+		}
+	} else if (actual_first_item_offset == expected_base) {
+		flags |= PADDING_MISSING_3KB;
+		fprintf(stream, "  Actual padding:              0x000 (0 bytes)\n");
+		fprintf(stream, "  Status:                      ✗ MISSING (no 3KB padding)\n");
+		fprintf(stream, "  Compliance:                  NON-COMPLIANT with BSP requirements\n");
+		fprintf(stream, "\n  ✗ CRITICAL: Missing 3KB padding will likely cause NAND boot failure!\n");
+		fprintf(stream, "    BSP TOC0 generation (createtoc0.c line 58):\n");
+		fprintf(stream, "      offset = ((header + items + 31) & ~31) + 3*1024;\n");
+		fprintf(stream, "    All working BSP TOC0 files have this padding\n");
+		fprintf(stream, "    SBROM may require this for proper TOC0 parsing in 1K mode\n");
+	} else {
+		fprintf(stream, "  Status:                      ✗ INVALID (first item before items table end)\n");
+		fprintf(stream, "  Compliance:                  CORRUPTED structure\n");
+	}
+
+	return flags;
+}
+
 void output_toc0_info(void *sector, FILE *inf, FILE *stream, bool verbose)
 {
 	toc0_main_info main_header;
@@ -1125,6 +1213,9 @@ void output_toc0_info(void *sector, FILE *inf, FILE *stream, bool verbose)
 	}
 
 	items = (toc0_item_info *)(toc0_data + sizeof(toc0_main_info));
+
+	/* Validate TOC0 padding structure */
+	validate_toc0_padding(main_info, items, stream);
 
 	for (uint32_t i = 0; i < main_info->num_items; i++) {
 		if (items[i].name == TOC0_ITEM_NAME_FW) {
