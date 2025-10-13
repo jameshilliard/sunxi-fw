@@ -101,6 +101,52 @@ typedef struct {
 	unsigned int Reserved[32];
 } boot_nand_para_t; // nand_type_rawnand.h redefine
 
+/* GPIO configuration structures from BSP */
+typedef struct {
+	char port;        /* port: PA/PB/PC/... */
+	char port_num;    /* internal port num: PA00/PA01/... */
+	char mul_sel;     /* function num */
+	char pull;        /* pull-up/pull-down/no-pull */
+	char drv_level;   /* driver level: 0-3 */
+	char data;        /* pin state */
+	char reserved[2];
+} normal_gpio_cfg;
+
+typedef struct {
+	unsigned char port;
+	unsigned char port_num;
+	char mul_sel;
+	char data;
+} special_gpio_cfg;
+
+/* TOC0 config structure that SPL reads at offset 0x80
+ * See: h616_longan-spl-opensource/sboot/main/sboot_main.c:21
+ *      sbrom_toc0_config_t *toc0_config = (sbrom_toc0_config_t *)(CONFIG_TOC0_CFG_ADDR);
+ *      where CONFIG_TOC0_CFG_ADDR = CONFIG_SYS_SRAM_BASE + 0x80
+ */
+typedef struct {
+	unsigned char config_vsn[4];
+	unsigned int dram_para[32];       /* DRAM parameters - CRITICAL for boot! */
+	int uart_port;                    /* UART controller number */
+	normal_gpio_cfg uart_ctrl[2];     /* UART GPIO */
+	int enable_jtag;                  /* JTAG enable */
+	normal_gpio_cfg jtag_gpio[5];     /* JTAG GPIO */
+	normal_gpio_cfg storage_gpio[50]; /* Storage GPIO: [0-23]=NAND, [24-31]=card0, [32-39]=card2, [40-49]=SPI */
+	char storage_data[384];           /* Storage parameters: [0-159]=NAND, [160-255]=card */
+	unsigned int secure_dram_mbytes;
+	unsigned int drm_start_mbytes;
+	unsigned int drm_size_mbytes;
+	unsigned int boot_cpu;
+	special_gpio_cfg a15_power_gpio;
+	unsigned int next_exe_pa;
+	unsigned int secure_without_OS;
+	unsigned char debug_mode;
+	unsigned char power_mode;
+	unsigned char reserver[2];
+	unsigned int card_work_mode;
+	unsigned int res[2];
+} sbrom_toc0_config_t;
+
 struct toc0_key_item {
 	uint32_t vendor_id;
 	uint32_t key0_n_len;
@@ -1017,6 +1063,122 @@ static void print_toc0_item(const toc0_item_info *item,
 	}
 }
 
+/* Decode and display TOC0 config structure at offset 0x80
+ * This structure is read by the SPL at runtime to configure hardware
+ */
+#define TOC0_CONFIG_OFFSET 0x80
+#define TOC0_CONFIG_SIZE sizeof(sbrom_toc0_config_t)
+
+static void decode_toc0_config(const uint8_t *toc0_data, size_t data_size, FILE *stream)
+{
+	const sbrom_toc0_config_t *config;
+	int i, non_zero_count;
+	bool has_valid_data = false;
+
+	fprintf(stream, "\nTOC0 Config Structure (SPL reads at offset 0x%X):\n", TOC0_CONFIG_OFFSET);
+
+	if (data_size < TOC0_CONFIG_OFFSET + TOC0_CONFIG_SIZE) {
+		fprintf(stream, "  ✗ Config structure not present (file too small)\n");
+		fprintf(stream, "  CRITICAL: SPL will fail to read DRAM parameters!\n");
+		return;
+	}
+
+	config = (const sbrom_toc0_config_t *)(toc0_data + TOC0_CONFIG_OFFSET);
+
+	/* Check if config has any data */
+	const uint8_t *config_bytes = (const uint8_t *)config;
+	for (i = 0; i < TOC0_CONFIG_SIZE; i++) {
+		if (config_bytes[i] != 0) {
+			has_valid_data = true;
+			break;
+		}
+	}
+
+	if (!has_valid_data) {
+		fprintf(stream, "  ✗ Config structure is EMPTY (all zeros)\n");
+		fprintf(stream, "  CRITICAL: SPL cannot boot without DRAM parameters!\n");
+		fprintf(stream, "\n  This structure must contain:\n");
+		fprintf(stream, "    - DRAM parameters (offset 0x84-0x103) - REQUIRED\n");
+		fprintf(stream, "    - UART configuration (offset 0x104+)\n");
+		fprintf(stream, "    - Storage GPIO (offset 0x154+)\n");
+		fprintf(stream, "    - Storage data/NAND params (offset 0x2D4+)\n");
+		return;
+	}
+
+	fprintf(stream, "  ✓ Config structure present\n\n");
+
+	/* Config version */
+	fprintf(stream, "  Config version:      %02x %02x %02x %02x\n",
+	        config->config_vsn[0], config->config_vsn[1],
+	        config->config_vsn[2], config->config_vsn[3]);
+
+	/* DRAM parameters - CRITICAL! */
+	fprintf(stream, "\n  DRAM Parameters (offset 0x%X):\n", TOC0_CONFIG_OFFSET + 4);
+	non_zero_count = 0;
+	for (i = 0; i < 32; i++) {
+		if (config->dram_para[i] != 0)
+			non_zero_count++;
+	}
+
+	if (non_zero_count == 0) {
+		fprintf(stream, "    ✗ CRITICAL: All DRAM parameters are ZERO!\n");
+		fprintf(stream, "    SPL will fail to initialize DRAM and crash!\n");
+	} else {
+		fprintf(stream, "    ✓ DRAM parameters present (%d non-zero values)\n", non_zero_count);
+		fprintf(stream, "    First few DRAM params: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+		        config->dram_para[0], config->dram_para[1],
+		        config->dram_para[2], config->dram_para[3]);
+	}
+
+	/* UART config */
+	fprintf(stream, "\n  UART Configuration:\n");
+	fprintf(stream, "    Port:                %d\n", config->uart_port);
+	if (config->uart_ctrl[0].port != 0 || config->uart_ctrl[0].port_num != 0) {
+		fprintf(stream, "    GPIO:                P%c%d (func=%d)\n",
+		        'A' + config->uart_ctrl[0].port - 1,
+		        config->uart_ctrl[0].port_num,
+		        config->uart_ctrl[0].mul_sel);
+	}
+
+	/* JTAG config */
+	fprintf(stream, "\n  JTAG Configuration:\n");
+	fprintf(stream, "    Enable:              %s\n", config->enable_jtag ? "Yes" : "No");
+
+	/* Storage GPIO - check for SPI config */
+	fprintf(stream, "\n  Storage GPIO Configuration:\n");
+	non_zero_count = 0;
+	for (i = 40; i < 50; i++) {  /* SPI GPIOs are [40-49] */
+		if (config->storage_gpio[i].port != 0 || config->storage_gpio[i].port_num != 0) {
+			non_zero_count++;
+		}
+	}
+	if (non_zero_count > 0) {
+		fprintf(stream, "    SPI GPIO [40-49]:    %d configured\n", non_zero_count);
+	} else {
+		fprintf(stream, "    SPI GPIO [40-49]:    Not configured\n");
+	}
+
+	non_zero_count = 0;
+	for (i = 0; i < 24; i++) {  /* NAND GPIOs are [0-23] */
+		if (config->storage_gpio[i].port != 0 || config->storage_gpio[i].port_num != 0) {
+			non_zero_count++;
+		}
+	}
+	if (non_zero_count > 0) {
+		fprintf(stream, "    NAND GPIO [0-23]:    %d configured\n", non_zero_count);
+	}
+
+	/* Other fields */
+	fprintf(stream, "\n  Other Configuration:\n");
+	fprintf(stream, "    Debug mode:          %s\n", config->debug_mode ? "Enabled" : "Disabled");
+	fprintf(stream, "    Power mode:          %d\n", config->power_mode);
+	fprintf(stream, "    Boot CPU:            %d\n", config->boot_cpu);
+
+	/* Note about storage_data */
+	fprintf(stream, "\n  Note: storage_data[384] at offset 0x2D4 contains NAND parameters\n");
+	fprintf(stream, "        (decoded separately in Storage Data Validation section)\n");
+}
+
 /* Validate TOC0 structure padding per BSP requirements
  * BSP createtoc0.c line 58 adds 3KB padding before first item:
  * offset = ((sizeof(sbrom_toc0_head_info_t) + 2 * sizeof(sbrom_toc0_item_info_t) + 31) & (~31)) + 3*1024;
@@ -1213,6 +1375,9 @@ void output_toc0_info(void *sector, FILE *inf, FILE *stream, bool verbose)
 	}
 
 	items = (toc0_item_info *)(toc0_data + sizeof(toc0_main_info));
+
+	/* Decode TOC0 config structure that SPL reads */
+	decode_toc0_config(toc0_data, data_size, stream);
 
 	/* Validate TOC0 padding structure */
 	validate_toc0_padding(main_info, items, stream);
